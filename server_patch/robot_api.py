@@ -16,6 +16,9 @@ from .storage import CsvStore
 
 robot_api_bp = Blueprint("robot_api", __name__, url_prefix="/api/robot/v1")
 
+MAX_CLOCK_SKEW_SECONDS = 120
+NONCE_TTL_SECONDS = 300
+
 
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -54,6 +57,14 @@ class RobotGatewayStore:
                     updated_at TEXT NOT NULL,
                     error TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE IF NOT EXISTS request_nonces (
+                    nonce TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_request_nonces_expiry
+                    ON request_nonces(expires_at);
             """)
             con.commit()
 
@@ -73,6 +84,21 @@ class RobotGatewayStore:
                     last_error=excluded.last_error
             """, (agent_id, now_utc(), visible_orders, last_error[:2000]))
             con.commit()
+
+    def use_nonce(self, nonce: str, agent_id: str) -> bool:
+        now = datetime.now(timezone.utc)
+        expires = datetime.fromtimestamp(now.timestamp() + NONCE_TTL_SECONDS, timezone.utc).isoformat(timespec="seconds")
+        with self._connect() as con:
+            con.execute("DELETE FROM request_nonces WHERE expires_at <= ?", (now.isoformat(timespec="seconds"),))
+            try:
+                con.execute(
+                    "INSERT INTO request_nonces(nonce,agent_id,expires_at,created_at) VALUES(?,?,?,?)",
+                    (nonce, agent_id, expires, now.isoformat(timespec="seconds")),
+                )
+                con.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
 
     def known_orders(self) -> set[str]:
         with self._connect() as con:
@@ -100,25 +126,64 @@ def gateway() -> RobotGatewayStore:
     return RobotGatewayStore(current_app.config["NEXO_DATA"])
 
 
-def _configured_token() -> str:
+def _configured_secret() -> bytes:
     token = os.environ.get("NEXO_ROBOT_TOKEN", "").strip()
-    if token:
-        return token
-    cfg = current_app.config.get("NEXO_CONFIG", {})
-    return str((cfg.get("robot_api") or {}).get("token") or "").strip()
-
-
-def _require_robot():
-    auth = request.headers.get("Authorization", "")
-    supplied = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-    configured = _configured_token()
-    if not configured or not supplied or not hmac.compare_digest(configured, supplied):
-        return jsonify(ok=False, message="Robô não autorizado."), 401
-    return None
+    if not token:
+        cfg = current_app.config.get("NEXO_CONFIG", {})
+        token = str((cfg.get("robot_api") or {}).get("token") or "").strip()
+    return token.encode("utf-8")
 
 
 def _agent_id() -> str:
-    return (request.headers.get("X-NEXO-Agent-ID") or "rm-desconhecido").strip()[:100]
+    return (request.headers.get("X-NEXO-Agent-ID") or "").strip()[:100]
+
+
+def _parse_timestamp(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _require_robot():
+    secret = _configured_secret()
+    agent_id = _agent_id()
+    timestamp = str(request.headers.get("X-NEXO-Timestamp") or "")
+    nonce = str(request.headers.get("X-NEXO-Nonce") or "")
+    declared_sha = str(request.headers.get("X-NEXO-Content-SHA256") or "").lower()
+    supplied_signature = str(request.headers.get("X-NEXO-Signature") or "").lower()
+
+    if len(secret) < 32 or not agent_id or not timestamp or not nonce or not declared_sha or not supplied_signature:
+        return jsonify(ok=False, message="Robô não autorizado."), 401
+    if len(nonce) < 16 or len(nonce) > 128:
+        return jsonify(ok=False, message="Requisição do robô inválida."), 401
+
+    parsed = _parse_timestamp(timestamp)
+    if not parsed or abs((datetime.now(timezone.utc) - parsed).total_seconds()) > MAX_CLOCK_SKEW_SECONDS:
+        return jsonify(ok=False, message="Requisição do robô expirada."), 401
+
+    if request.mimetype != "multipart/form-data":
+        actual_body_sha = hashlib.sha256(request.get_data(cache=True)).hexdigest()
+        if not hmac.compare_digest(actual_body_sha, declared_sha):
+            return jsonify(ok=False, message="Integridade da requisição inválida."), 401
+
+    message = "\n".join([
+        request.method.upper(),
+        request.path,
+        timestamp,
+        nonce,
+        declared_sha,
+    ]).encode("utf-8")
+    expected_signature = hmac.new(secret, message, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_signature, supplied_signature):
+        return jsonify(ok=False, message="Robô não autorizado."), 401
+
+    if not gateway().use_nonce(nonce, agent_id):
+        return jsonify(ok=False, message="Requisição repetida bloqueada."), 409
+    return None
 
 
 @robot_api_bp.post("/heartbeat")
@@ -202,8 +267,11 @@ def upload_pdf(order_number: str):
                 return jsonify(ok=False, message="Arquivo recebido não é PDF válido."), 400
 
         actual_sha = digest.hexdigest()
-        declared = str(request.form.get("sha256") or "").lower()
-        if declared and not hmac.compare_digest(declared, actual_sha):
+        declared_form = str(request.form.get("sha256") or "").lower()
+        declared_header = str(request.headers.get("X-NEXO-Content-SHA256") or "").lower()
+        if not declared_form or not declared_header:
+            return jsonify(ok=False, message="SHA-256 obrigatório."), 400
+        if not hmac.compare_digest(declared_form, actual_sha) or not hmac.compare_digest(declared_header, actual_sha):
             return jsonify(ok=False, message="SHA-256 do PDF não confere."), 400
 
         if previous:
